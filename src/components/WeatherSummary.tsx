@@ -36,7 +36,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     alignSelf: "stretch",
     paddingHorizontal: 24,
-    paddingTop: 72,
+    paddingTop: 120,
   },
   city: {
     alignSelf: "center",
