@@ -13,6 +13,10 @@ scene data extracted from the app bundle's `Mica/` directory.
 
 ## How it works
 
+The Weather bundle ships **two** background systems. This project uses the
+older one, `Mica/`, for reasons covered in [Why Mica and not
+VFX](#why-mica-and-not-vfx).
+
 Apple ships 537 `.caml` files — one per weather condition × day/night × device
 size. They are plain Core Animation XML: layer trees, tiled scrolling images,
 and `CAEmitterLayer` particle systems with full cell parameters and behaviors.
@@ -152,12 +156,52 @@ and `age` is derived from `clock mod period`. Two subtleties matter:
 A thunderstorm is 62 emitters and 99 cells, of which 60 are path emitters — 12
 strikes of roughly 5 branches each, one firing every ~12 seconds.
 
-## The modern (VFX) backgrounds
+## Why Mica and not VFX
 
-`VFX/` in the bundle holds the iOS 15+ system: a 610-entity ECS scene graph for
-Apple's private VFXCore engine plus ~460 cloud textures. The scene defines the
-machinery and exposes 187 named parameters (sky gradient, sun angle, five cloud
-layers, precipitation, lightning, stars) but ships **no values** — the
-per-condition presets are compiled into the `Weather` binary. Recreating that
-path means reimplementing an undocumented particle runtime, which is why this
-project builds on the `.caml` set instead.
+The extracted bundle contains two separate background systems:
+
+| | `Mica/` | `VFX/` |
+|---|---|---|
+| era | iOS 14 (Core Animation) | iOS 15+ (VFXCore) |
+| contents | 537 `.caml` + 96 PNG | 1 ECS scene graph + ~460 textures |
+| parameter values | **inline in the XML** | **absent — compiled into the binary** |
+| runtime needed | a `CAEmitterCell` equivalent | Apple's private ECS engine + Metal shaders |
+
+This project is 100% Mica: all 83 sprites are PNGs from that directory, with no
+`.ktx`/`.heic` files and none of the `_POS`/`_NEG`/`_ALPHA` triplets that mark
+the VFX set.
+
+**Mica is self-describing.** Every value needed to redraw a scene — gradients,
+birth rates, velocities, lifetimes, colour ramps, the lightning paths — sits in
+readable XML. That is the whole reason this project was tractable.
+
+**VFX is machinery without numbers.** `WeatherCombinedV75_Background.vfx` is a
+610-entity ECS scene graph exposing 187 named parameters (`gradientTop`,
+`sunAngle`, five cloud layers, `lightningNumberOfBranches`, …) and shipping *no
+values for any of them*. The per-condition presets are compiled into the
+`Weather` executable — grepping the binary for those parameter names hits
+plaintext, so they are in there, just not as data. Using VFX therefore means
+both reimplementing an undocumented particle runtime *and* recovering ~187
+floats × 77 conditions out of a Mach-O.
+
+### What Mica costs you
+
+VFX genuinely looks better. Its cloud textures ship as POS/NEG/ALPHA triplets —
+a pre-baked lighting trick that blends positive- and negative-lit variants by
+sun angle, giving clouds that respond to time of day. It also computes the sky
+gradient dynamically, whereas Mica ships flat PNG skies (which is why
+`src/constants/sky.ts` has to pick a backdrop colour by hand).
+
+### The middle path
+
+You can keep this engine and adopt the VFX *art* without the VFX runtime: swap
+in the cloud textures and drive the POS/NEG blend from a sun-angle value you
+supply yourself. The textures need KTX/HEIC → PNG conversion first.
+
+### Unchecked lead
+
+`PlugIns/WeatherWidget.appex/` contains `ClearDay.json` and `RainyDay.json`.
+Condition-named JSON sitting beside the widget is exactly where a preset table
+would live. If those hold VFX parameter values, the trade-off above changes
+considerably — you would have the format, and the remaining conditions likely
+follow the same shape. Their contents have not been examined.
