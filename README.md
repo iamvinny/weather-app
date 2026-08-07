@@ -1,7 +1,15 @@
 # weather-app
 
+<p align="center">
+  <img src="assets/weatherkit-96x96_2x.png" alt="Apple Weather WebKit Logo">
+</p>
+
 Recreates the iOS Weather app's animated backgrounds in Expo, driven by the
 scene data extracted from the app bundle's `Mica/` directory.
+
+<p align="center">
+  <img src="assets/screenshots.png" alt="App Runtime Screenshots">
+</p>
 
 ## How it works
 
@@ -15,34 +23,41 @@ copies the sprites it references. `src/engine/` renders that JSON with
 react-native-skia.
 
 ```
-tools/caml_to_scene.py       .caml -> runtime scene JSON + sprites
-src/engine/types.ts          scene/emitter/cell shapes
-src/engine/emitter.ts        CAEmitterCell-equivalent simulation (worklets)
-src/engine/CellLayer.tsx     one cell -> one Skia Atlas draw call
-src/engine/TileLayer.tsx     tiled/scrolling image layers
-src/engine/states.ts         LKState resolution (Full / Mini / Landscape)
-src/engine/WeatherScene.tsx  composes a scene, scales it to the device
-src/engine/assets.ts         static registry Metro can resolve
+tools/caml_to_scene.py        .caml -> runtime scene JSON + sprites
+
+src/app/                      expo-router routes (_layout, index)
+src/components/               screen-level UI
+src/constants/                collapse geometry, sky colours
+
+src/engine/                   the renderer, self-contained
+  types.ts                    scene/emitter/cell shapes
+  emitter.ts                  CAEmitterCell-equivalent simulation (worklets)
+  CellLayer.tsx               one cell -> one Skia Atlas draw call
+  TileLayer.tsx               tiled/scrolling image layers
+  states.ts                   LKState resolution (Full / Mini / Landscape)
+  WeatherScene.tsx            composes a scene, scales it to the device
+  assets.ts                   generated registry Metro can resolve
 ```
 
-## Adding a condition
+Routing is expo-router with `src/app` as the routes directory; `@/*` is aliased
+to `src/*`. `src/engine/` is kept whole rather than split across
+`components/`/`hooks/`: it is a library with one public entry point
+(`WeatherScene`) and no knowledge of the app around it.
+
+## Converting scenes
 
 ```sh
-python3 tools/caml_to_scene.py ../Extracted_IOS_Files/Mica snow_night
+# every condition, plus a regenerated src/engine/assets.ts
+python3 tools/caml_to_scene.py /path/to/Extracted_IOS_Files/Mica --all
+
+# just one
+python3 tools/caml_to_scene.py /path/to/Extracted_IOS_Files/Mica snow_night
 ```
 
-Then register the scene and any new sprites in `src/engine/assets.ts` — Metro
-needs static `require` paths, so this step can't be automatic.
-
-Available conditions (42): blizzard, blowingSnow, breezy, clear, cloudy,
-drizzle, dust, flurries, fog, frigid, hail, haze, heavyRain, heavySnow, hot,
-hurricane, isolatedThundershowers, isolatedThunderstorms, mixedRainAndSleet,
-mixedRainAndSnow, mixedRainfall, mixedSnowAndSleet, mostlyClear, mostlyCloudy,
-mostlySunny, partlyCloudy, rain, rainbow, scatteredShowers,
-scatteredSnowShowers, scatteredThunderstorms, severeThunderstorm, showers,
-sleet, smoke, snow, snowShowers, sunny, thunderstorm, tornado, tropicalStorm,
-windy — each as `<condition>_day` / `<condition>_night`, or bare for the
-time-independent ones (`clear`, `hot`, `mostlySunny`, `rainbow`).
+`--all` produces all **77 scenes** (42 conditions × day/night, plus the
+time-independent `clear`, `hot`, `mostlySunny`, `rainbow`) and writes the
+registry, since Metro needs static `require` paths. Single-condition runs leave
+the registry alone, so add the entry by hand or re-run `--all`.
 
 ## Things worth knowing about the format
 
@@ -52,14 +67,33 @@ cover the device. The converter flips to y-down. This is confirmed by the `Mini`
 state, which culls the rain emitter to design y 846..2046 — the top 290px of the
 screen once flipped, i.e. the collapsed header.
 
-**Emission direction comes from the container, not the cells.** No cell carries
-an `emissionLongitude`, so all travel direction comes from the `Rotation` layer
-the app turns at runtime. That is also how the app tilts precipitation with
-wind: change `scene.rotation` (π/2 is straight down) and rain slants.
+**Most cells take their direction from the container.** 701 of 903 cells carry
+no `emissionLongitude` at all, so their travel direction comes from the
+`Rotation` layer the app turns at runtime. That is also how the app tilts
+precipitation with wind: change `scene.rotation` (π/2 is straight down) and
+rain slants.
 
 **There are no gradient layers.** Zero `CAGradientLayer` instances across all
-537 files — skies ship as pre-rendered PNGs, so `App.tsx` supplies a flat
-backdrop behind the scene.
+537 files — skies ship as pre-rendered PNGs, so `src/constants/sky.ts` supplies
+a flat backdrop.
+
+**Additive layers need the sky inside the canvas.** 377 emitters use
+`renderMode="cheapAdditive"`, and additive sprites are authored on black
+because black adds nothing. `plus` blending adds alpha too, so over a
+*transparent* canvas those sprites add onto transparent black and composite as
+opaque black rectangles — a black band across the top of every storm scene.
+The sky therefore has to be painted inside the Skia canvas (`<Fill>`), not as a
+React Native view behind it, so the additive layers have something to add onto.
+
+**Emission angles negate on the y-flip, and 0 means "unspecified".** 202 cells
+carry an explicit `emissionLongitude`, authored in the y-up design space, so
+the angle negates along with the geometry. Every non-zero value in the corpus
+lands somewhere downward that way: thunderstorm −90° → straight down, blizzard
+−162° and tropicalStorm −151° → steep wind-blown slants, the shooting star
+−70° → down and to the right. A literal `0` is Apple's tooling writing the
+default rather than "point along +x" — `rain_night` omits the attribute
+entirely and must still fall — so 0 falls back to the container's downward
+direction. Getting this wrong sends blizzard snow flying upward.
 
 **Cull rects use ±DBL_MAX for "unbounded".** An axis Apple doesn't want clipped
 is stored as ±1.797e308 rather than omitted, so flipping it arithmetically
@@ -70,7 +104,7 @@ region of design space a state actually shows by clipping every emitter's cull
 rect to the canvas, then aligns that band's bottom to the visible height. No
 state needs special-casing: `Full`'s rects are wider than the canvas so it
 yields the whole scene, while `Mini`'s clip to the collapsed header strip. That
-is what lets `App.tsx` drive the collapse straight from scroll position.
+is what lets the route drive the collapse straight from scroll position.
 
 **States are real animation data.** Each scene carries `Full`, `Mini` and
 `Landscape` as key-path overrides against layer ids, with spring stiffness and
@@ -86,15 +120,37 @@ cross-frame state for Reanimated to serialize, nothing to compact when a
 particle dies, and no per-frame allocation. The field is already full on the
 first frame.
 
-The tradeoff: one-shot bursts aren't modelled. Continuous precipitation, cloud
-drift and wind all work; the 12 lightning bolts in `thunderstorm_night` need a
-stateful pass with `CAEmitterCell.beginTime` / `repeatCount` honoured.
-
 Implemented: birth rate, lifetime (+range), velocity (+range), emission angle
 and range, x/y acceleration, scale (+range, +speed), alpha (+range, +speed),
-spin (+range), cull rects, `valueOverLife` and `valueOverDistance` alpha
-curves, and `wave` displacement. Not yet: `attractor` and `colorOverLife`
-behaviors, sprite-sheet frame animation (`contentsFrameCount`), and `alignToMotion`.
+spin (+range), cull rects, sprite-sheet frames (`contentsFrameCount` /
+`contentsFramesPerRow` / `contentsFrameMode`), render modes (Apple's
+`cheapAdditive` → Skia `plus`), path emitters with `sequential` emission, burst
+scheduling (`beginTime` / `duration` / `repeatCount`), and the `valueOverLife`,
+`valueOverDistance`, `colorOverLife`, `wave`, `attractor` and `alignToMotion`
+behaviors. The attractor is an approximation — a distance-falloff pull rather
+than Core Animation's exact force model.
+
+Not implemented: the `light` behavior (35 uses), `emissionLatitude` (the scenes
+are effectively 2D), and `CAEmitterCell.particleType` variants beyond sprites.
+
+### Bursts are still stateless
+
+Lightning looked like it would force a mutable simulation, but it doesn't:
+Apple's bolts repeat on a fixed cycle, so they stay a pure function of the
+clock. A burst cell emits across a short `window` that recurs every `period`,
+and `age` is derived from `clock mod period`. Two subtleties matter:
+
+- **Nested time.** Core Animation composes timing down the tree — a child's
+  local time is `(parent_time - beginTime) * speed`. Flattening the layer tree
+  loses that, so the converter folds it into one `(beginTime, speed)` pair per
+  emitter. Without it every bolt inherits phase 0 and the whole storm fires at
+  once instead of staggering across 16s, 23s, 24s, 40s…
+- **Inherited windows.** A child's active window is clipped by its parent's.
+  The bolt branches declare no `duration` of their own, so they must inherit
+  the parent bolt's cycle; treated as continuous emitters they glow forever.
+
+A thunderstorm is 62 emitters and 99 cells, of which 60 are path emitters — 12
+strikes of roughly 5 branches each, one firing every ~12 seconds.
 
 ## The modern (VFX) backgrounds
 

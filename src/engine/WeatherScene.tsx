@@ -1,5 +1,5 @@
 import React, { useMemo } from "react";
-import { Canvas, Group, useClock, type SkImage } from "@shopify/react-native-skia";
+import { Canvas, Fill, Group, useClock, type SkImage } from "@shopify/react-native-skia";
 import { useDerivedValue, type SharedValue } from "react-native-reanimated";
 import { CellLayer } from "./CellLayer";
 import { TileLayer } from "./TileLayer";
@@ -21,6 +21,16 @@ type Props = {
   viewHeight?: SharedValue<number>;
   /** "Full" is the expanded background; "Mini" is the collapsed header. */
   state?: string;
+  /**
+   * Backdrop colour, painted inside the canvas.
+   *
+   * This has to live here rather than behind the canvas: Apple's additive
+   * layers (renderMode "cheapAdditive") are authored on black, because black
+   * adds nothing. Composited with `plus` over a transparent canvas they add
+   * onto transparent black and turn into opaque black rectangles -- they need
+   * an opaque sky in the same surface to add onto.
+   */
+  sky?: string;
 };
 
 /**
@@ -36,6 +46,7 @@ export const WeatherScene = ({
   canvasHeight,
   viewHeight,
   state = "Full",
+  sky,
 }: Props) => {
   const clock = useClock();
   const [dw, dh] = scene.designSize;
@@ -100,6 +111,7 @@ export const WeatherScene = ({
 
   return (
     <Canvas style={{ width, height: canvasHeight }}>
+      {sky && <Fill color={sky} />}
       <Group transform={transform}>
         {tiles.map((node, i) => {
           const image = images[node.image];
@@ -107,7 +119,7 @@ export const WeatherScene = ({
           return <TileLayer key={`tile-${i}`} node={node} image={image} clock={clock} />;
         })}
 
-        {emitters.map(({ cells }, ei) =>
+        {emitters.map(({ node, cells }, ei) =>
           cells.map(({ cell, prepared }, ci) => {
             const image = images[cell.image!];
             if (!image) return null;
@@ -117,6 +129,7 @@ export const WeatherScene = ({
                 prepared={prepared}
                 image={image}
                 clock={clock}
+                blendMode={node.blendMode}
               />
             );
           })

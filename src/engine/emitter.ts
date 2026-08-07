@@ -3,14 +3,22 @@ import type { Behavior, Cell, EmitterNode } from "./types";
 /**
  * A CAEmitterCell-equivalent simulation.
  *
- * Apple's emitters here are steady-state: a constant birth rate feeding a fixed
- * lifetime. So rather than keeping mutable particle state, each particle index
- * owns a deterministic seed and its whole life is a pure function of the clock.
- * That keeps the simulation allocation-free and safe to run in a worklet, at the
- * cost of not modelling one-shot bursts (lightning bolts need a stateful pass).
+ * Particles are evaluated independently per index rather than simulated into a
+ * shared buffer: each slot owns a deterministic seed and its whole life is a
+ * pure function of the clock. That keeps every worklet pure -- no cross-frame
+ * state for Reanimated to serialize, and nothing to compact when a particle
+ * dies -- and it extends to bursts too, because Apple's one-shot emitters
+ * (lightning) repeat on a fixed period and so are still periodic in time.
  */
 
+/** Ceiling for a continuously emitting cell. */
 export const MAX_PARTICLES = 1200;
+/**
+ * Ceiling for a path emitter. The bolts ask for 1000 sprites each and a
+ * thunderstorm has twelve of them; at that budget the UI thread cannot keep
+ * 60fps, and the bolt reads the same with far fewer sprites along the path.
+ */
+export const MAX_PATH_PARTICLES = 220;
 
 /** Deterministic per-particle randomness in [0,1). */
 function rnd(i: number, k: number): number {
@@ -36,6 +44,21 @@ function sampleCurve(values: number[], u: number): number {
   const i = Math.floor(x);
   if (i >= n - 1) return values[n - 1];
   return values[i] + (values[i + 1] - values[i]) * (x - i);
+}
+
+/** Sample one channel of a flat RGBA keyframe list. */
+function sampleRGBA(values: number[], u: number, channel: number): number {
+  "worklet";
+  const stops = Math.floor(values.length / 4);
+  if (stops === 0) return 1;
+  if (stops === 1) return values[channel];
+  const c = u < 0 ? 0 : u > 1 ? 1 : u;
+  const x = c * (stops - 1);
+  const i = Math.floor(x);
+  if (i >= stops - 1) return values[(stops - 1) * 4 + channel];
+  const a = values[i * 4 + channel];
+  const b = values[(i + 1) * 4 + channel];
+  return a + (b - a) * (x - i);
 }
 
 export type PreparedCell = {
@@ -70,16 +93,43 @@ export type PreparedCell = {
   alphaOverDistance: number[];
   falloff: number;
   scaleOverLife: number[];
+  colorOverLife: number[];
   waveForce: number;
   waveFrequency: number;
+  attractorX: number;
+  attractorY: number;
+  attractorForce: number;
+  attractorFalloff: number;
+  alignToMotion: number;
   timeScale: number;
+
+  // Burst scheduling. `period` of 0 means the cell emits continuously.
+  period: number;
+  phase: number;
+  window: number;
+
+  // Path emission (emitterShape="path").
+  pathX: number[];
+  pathY: number[];
+  sequential: number;
+
+  // Sprite-sheet frames.
+  frameCount: number;
+  framesPerRow: number;
+  frameW: number;
+  frameH: number;
+  frameFPS: number;
+  frameRandom: number;
 };
 
-function behaviorCurve(behaviors: Behavior[] | undefined, kind: string, keyPath: string) {
-  const b = behaviors?.find(
-    (x) => x.behavior === kind && x.keyPath === keyPath && x.enabled !== false
+function findBehavior(behaviors: Behavior[] | undefined, kind: string, keyPath?: string) {
+  return behaviors?.find(
+    (b) => b.behavior === kind && b.enabled !== false && (!keyPath || b.keyPath === keyPath)
   );
-  return b?.values ?? [];
+}
+
+function curve(behaviors: Behavior[] | undefined, kind: string, keyPath: string) {
+  return findBehavior(behaviors, kind, keyPath)?.values ?? [];
 }
 
 /**
@@ -95,15 +145,34 @@ export function prepareCell(
   const lifetime = cell.lifetime ?? 1;
   const lifetimeRange = cell.lifetimeRange ?? 0;
   const rate = (cell.birthRate ?? 0) * emitter.birthRate * birthScale;
-  const count = Math.min(MAX_PARTICLES, Math.ceil(rate * (lifetime + lifetimeRange)));
 
-  const wave = cell.behaviors?.find((b) => b.behavior === "wave" && b.enabled !== false);
-  const dist = cell.behaviors?.find(
-    (b) => b.behavior === "valueOverDistance" && b.keyPath === "color.alpha" && b.enabled !== false
-  );
+  const path = emitter.path ?? [];
+  const onPath = emitter.shape === "path" && path.length > 1;
+
+  // A looping emitter with a finite duration is a burst: it emits for
+  // `cell.duration` local seconds, then goes quiet until the window comes
+  // round again. Everything here stays in the emitter's local time.
+  const burst = emitter.repeatCount === -1 && emitter.duration > 0;
+  const window = burst ? cell.duration ?? 0 : 0;
+  const period = burst ? emitter.duration : 0;
+
+  const cap = onPath ? MAX_PATH_PARTICLES : MAX_PARTICLES;
+  const demand = burst && window > 0 ? rate * window : rate * (lifetime + lifetimeRange);
+  const count = Math.min(cap, Math.max(0, Math.ceil(demand)));
+
+  const wave = findBehavior(cell.behaviors, "wave");
+  const dist = findBehavior(cell.behaviors, "valueOverDistance", "color.alpha");
+  const attractor = findBehavior(cell.behaviors, "attractor");
+  const align = findBehavior(cell.behaviors, "alignToMotion");
 
   const [w, h] = emitter.emitterSize;
   const line = emitter.shape === "line";
+
+  // contentsRect gives frame 0's sub-rect in normalized units. A few cells
+  // carry pixel values instead; those are not grids, so ignore them.
+  const rect = cell.contentsRect;
+  const usable = rect && rect.length === 4 && rect[2] <= 1 && rect[3] <= 1;
+  const frameCount = cell.contentsFrameCount ?? 0;
 
   return {
     count,
@@ -111,9 +180,16 @@ export function prepareCell(
     lifetimeRange,
     velocity: cell.velocity ?? 0,
     velocityRange: cell.velocityRange ?? 0,
-    // Core Animation measures emissionLongitude from +x; the scene's container
-    // rotation is what actually points precipitation downward.
-    angle: sceneRotation + (cell.emissionLongitude ?? 0),
+    // Emission direction. The design space is y-up, so an authored angle
+    // negates on the flip to screen space; every non-zero value in the corpus
+    // lands somewhere downward that way (thunderstorm -90 -> straight down,
+    // blizzard -162 and tropicalStorm -151 -> steep wind-blown slants, the
+    // shooting star -70 -> down and to the right).
+    //
+    // Zero is treated as "unspecified" rather than "point along +x": rain_night
+    // omits the attribute entirely and must fall, so down is this pipeline's
+    // default, and Apple's tooling writes a literal 0 for the same intent.
+    angle: cell.emissionLongitude ? -cell.emissionLongitude : sceneRotation,
     emissionRange: cell.emissionRange ?? 0,
     scale: cell.scale ?? 1,
     scaleRange: cell.scaleRange ?? 0,
@@ -128,31 +204,44 @@ export function prepareCell(
     rotation: cell.rotation ?? 0,
     originX: emitter.emitterPosition[0],
     originY: emitter.emitterPosition[1],
-    spanX: line ? w : w,
+    spanX: w,
     spanY: line ? 0 : h,
     r: cell.color[0],
     g: cell.color[1],
     b: cell.color[2],
-    cullTop: emitter.cullRect ? emitter.cullRect[1] : -Infinity,
-    cullBottom: emitter.cullRect ? emitter.cullRect[1] + emitter.cullRect[3] : Infinity,
-    alphaOverLife: behaviorCurve(cell.behaviors, "valueOverLife", "color.alpha"),
+    cullTop: emitter.cullRect ? emitter.cullRect[1] : -1e9,
+    cullBottom: emitter.cullRect ? emitter.cullRect[1] + emitter.cullRect[3] : 1e9,
+    alphaOverLife: curve(cell.behaviors, "valueOverLife", "color.alpha"),
     alphaOverDistance: dist?.values ?? [],
     falloff: dist?.falloff ?? 0,
-    scaleOverLife: behaviorCurve(cell.behaviors, "valueOverLife", "scale"),
+    scaleOverLife: curve(cell.behaviors, "valueOverLife", "scale"),
+    colorOverLife: findBehavior(cell.behaviors, "colorOverLife")?.values ?? [],
     waveForce: wave?.force ?? 0,
     waveFrequency: wave?.frequency ?? 0,
+    attractorX: attractor?.position?.[0] ?? 0,
+    attractorY: attractor?.position?.[1] ?? 0,
+    attractorForce: attractor?.force ?? 0,
+    attractorFalloff: attractor?.falloff || 1,
+    alignToMotion: align ? 1 : 0,
     // CAEmitterLayer.speed scales the emitter's whole sense of time.
     timeScale: emitter.speed || 1,
+
+    period,
+    phase: emitter.beginTime + (cell.beginTime ?? 0),
+    window,
+
+    pathX: onPath ? path.map((p) => p[0]) : [],
+    pathY: onPath ? path.map((p) => p[1]) : [],
+    sequential: emitter.mode === "sequential" ? 1 : 0,
+
+    frameCount,
+    framesPerRow: cell.contentsFramesPerRow ?? frameCount ?? 1,
+    frameW: usable ? rect![2] : 1,
+    frameH: usable ? rect![3] : 1,
+    frameFPS: cell.contentsFramesPerSecond ?? 0,
+    frameRandom: cell.contentsFrameMode === "random" ? 1 : 0,
   };
 }
-
-/**
- * Particles are evaluated independently per index rather than simulated into a
- * shared buffer. That keeps every worklet pure -- no cross-frame state for
- * Reanimated to serialize, and nothing to compact when a particle dies. The
- * cost is recomputing position in both the transform and colour passes, which
- * is a handful of trig calls per particle.
- */
 
 /** Lifetime of slot `i`, including its per-particle variance. */
 function lifeOf(p: PreparedCell, i: number): number {
@@ -161,17 +250,28 @@ function lifeOf(p: PreparedCell, i: number): number {
 }
 
 /**
- * Age of slot `i` at time `t`, or -1 if it has no valid lifetime. Births are
- * staggered evenly so the field is already full on the first frame, then each
- * slot recycles forever.
+ * Age of slot `i` at time `t` (seconds), or -1 when it is not currently alive.
+ *
+ * Continuous cells stagger births evenly across the lifetime so the field is
+ * already full on the first frame. Burst cells instead emit across a short
+ * window that repeats every `period`, which is how the lightning bolts fire.
  */
 function ageOf(p: PreparedCell, t: number, i: number): number {
   "worklet";
   const life = lifeOf(p, i);
-  if (life <= 0) return -1;
-  const scaled = t * p.timeScale;
+  if (life <= 0 || p.count === 0) return -1;
+  const local = (t - p.phase) * p.timeScale;
+
+  if (p.period > 0) {
+    let cycle = local % p.period;
+    if (cycle < 0) cycle += p.period;
+    const emitted = p.window > 0 ? (i / p.count) * p.window : 0;
+    const age = cycle - emitted;
+    return age < 0 || age > life ? -1 : age;
+  }
+
   const born = (i / p.count) * life;
-  const age = (scaled - born) % life;
+  const age = (local - born) % life;
   return age < 0 ? age + life : age;
 }
 
@@ -185,21 +285,56 @@ function dirOf(p: PreparedCell, i: number): number {
   return p.angle + p.emissionRange * spread(i, 2) * 0.5;
 }
 
+/** Spawn point for slot `i`: along the path, or across the emitter's extent. */
+function spawnX(p: PreparedCell, i: number): number {
+  "worklet";
+  const n = p.pathX.length;
+  if (n > 1) {
+    const u = p.sequential === 1 ? i / p.count : rnd(i, 9);
+    const x = u * (n - 1);
+    const k = Math.floor(x);
+    if (k >= n - 1) return p.pathX[n - 1];
+    return p.pathX[k] + (p.pathX[k + 1] - p.pathX[k]) * (x - k);
+  }
+  return p.originX + p.spanX * (rnd(i, 4) - 0.5);
+}
+
+function spawnY(p: PreparedCell, i: number): number {
+  "worklet";
+  const n = p.pathY.length;
+  if (n > 1) {
+    const u = p.sequential === 1 ? i / p.count : rnd(i, 9);
+    const x = u * (n - 1);
+    const k = Math.floor(x);
+    if (k >= n - 1) return p.pathY[n - 1];
+    return p.pathY[k] + (p.pathY[k + 1] - p.pathY[k]) * (x - k);
+  }
+  return p.originY + p.spanY * (rnd(i, 5) - 0.5);
+}
+
 function xOf(p: PreparedCell, age: number, i: number, dist: number): number {
   "worklet";
-  let x =
-    p.originX + p.spanX * (rnd(i, 4) - 0.5) + Math.cos(dirOf(p, i)) * dist + 0.5 * p.ax * age * age;
+  let x = spawnX(p, i) + Math.cos(dirOf(p, i)) * dist + 0.5 * p.ax * age * age;
   if (p.waveForce !== 0) {
     x += Math.sin(age * p.waveFrequency * Math.PI * 2 + i) * p.waveForce;
+  }
+  if (p.attractorForce !== 0) {
+    // Approximates CAEmitterBehavior's radial attractor: a pull toward the
+    // anchor that falls off with distance.
+    const dx = p.attractorX - x;
+    x += (dx / (1 + Math.abs(dx) / p.attractorFalloff)) * p.attractorForce * age * 0.01;
   }
   return x;
 }
 
 function yOf(p: PreparedCell, age: number, i: number, dist: number): number {
   "worklet";
-  return (
-    p.originY + p.spanY * (rnd(i, 5) - 0.5) + Math.sin(dirOf(p, i)) * dist + 0.5 * p.ay * age * age
-  );
+  let y = spawnY(p, i) + Math.sin(dirOf(p, i)) * dist + 0.5 * p.ay * age * age;
+  if (p.attractorForce !== 0) {
+    const dy = p.attractorY - y;
+    y += (dy / (1 + Math.abs(dy) / p.attractorFalloff)) * p.attractorForce * age * 0.01;
+  }
+  return y;
 }
 
 /** Opacity of particle `i` at time `t`; 0 when culled or fully faded. */
@@ -215,11 +350,22 @@ export function particleAlpha(p: PreparedCell, t: number, i: number): number {
   let a = p.alpha + p.alphaRange * spread(i, 6) + p.alphaSpeed * age;
   const u = age / lifeOf(p, i);
   if (p.alphaOverLife.length) a *= sampleCurve(p.alphaOverLife, u);
+  if (p.colorOverLife.length) a *= sampleRGBA(p.colorOverLife, u, 3);
   if (p.alphaOverDistance.length) {
     a *= sampleCurve(p.alphaOverDistance, p.falloff > 0 ? Math.abs(dist) / p.falloff : u);
   }
   if (a <= 0.002) return 0;
   return a > 1 ? 1 : a;
+}
+
+/** Tint of particle `i` for one RGB channel, honouring colorOverLife. */
+export function particleTint(p: PreparedCell, t: number, i: number, channel: number): number {
+  "worklet";
+  const base = channel === 0 ? p.r : channel === 1 ? p.g : p.b;
+  if (!p.colorOverLife.length) return base;
+  const age = ageOf(p, t, i);
+  if (age < 0) return base;
+  return base * sampleRGBA(p.colorOverLife, age / lifeOf(p, i), channel);
 }
 
 /** Position, scale and rotation of particle `i`, written into an RSXform. */
@@ -246,7 +392,10 @@ export function particleXform(
   }
 
   const dist = distOf(p, age, i);
-  const rot = p.rotation + (p.spin + p.spinRange * spread(i, 8)) * age;
+  const rot =
+    p.alignToMotion === 1
+      ? dirOf(p, i) + p.rotation
+      : p.rotation + (p.spin + p.spinRange * spread(i, 8)) * age;
   const scos = Math.cos(rot) * s;
   const ssin = Math.sin(rot) * s;
   // RSXform positions the sprite's top-left, so offset by the rotated centre.
@@ -256,4 +405,41 @@ export function particleXform(
     xOf(p, age, i, dist) - (scos * halfW - ssin * halfH),
     yOf(p, age, i, dist) - (ssin * halfW + scos * halfH)
   );
+}
+
+/**
+ * Sub-rect of the sprite sheet for particle `i`, written into a rect.
+ * Cells without a sheet get the whole image.
+ */
+export function particleFrame(
+  p: PreparedCell,
+  t: number,
+  i: number,
+  imgW: number,
+  imgH: number,
+  val: { setXYWH: (x: number, y: number, w: number, h: number) => void }
+): void {
+  "worklet";
+  const fw = p.frameW * imgW;
+  const fh = p.frameH * imgH;
+  if (p.frameCount <= 1) {
+    val.setXYWH(0, 0, fw, fh);
+    return;
+  }
+
+  let frame: number;
+  if (p.frameRandom === 1) {
+    frame = Math.floor(rnd(i, 11) * p.frameCount);
+  } else {
+    const age = ageOf(p, t, i);
+    // A framesPerSecond of 0 means the sheet plays across the whole lifetime.
+    const u = p.frameFPS > 0 ? age * p.frameFPS : (age < 0 ? 0 : age / lifeOf(p, i)) * p.frameCount;
+    frame = Math.floor(u) % p.frameCount;
+    if (frame < 0) frame += p.frameCount;
+  }
+
+  const perRow = p.framesPerRow > 0 ? p.framesPerRow : p.frameCount;
+  const col = frame % perRow;
+  const row = Math.floor(frame / perRow);
+  val.setXYWH(col * fw, row * fh, fw, fh);
 }

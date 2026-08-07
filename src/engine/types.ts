@@ -1,5 +1,16 @@
+/** The only Skia blend modes tools/caml_to_scene.py emits. */
+export type BlendModeName = "srcOver" | "plus" | "screen";
+
 export type Behavior = {
-  behavior: "valueOverLife" | "valueOverDistance" | "colorOverLife" | "wave" | "attractor" | string;
+  behavior:
+    | "valueOverLife"
+    | "valueOverDistance"
+    | "colorOverLife"
+    | "wave"
+    | "attractor"
+    | "alignToMotion"
+    | "light"
+    | string;
   keyPath?: string;
   enabled?: boolean;
   values?: number[];
@@ -9,6 +20,8 @@ export type Behavior = {
   falloffDistance?: number;
   orientationLatitude?: number;
   orientationLongitude?: number;
+  stiffness?: number;
+  radius?: number;
   position?: number[];
 };
 
@@ -21,7 +34,9 @@ export type Cell = {
   contentsRect?: number[];
   contentsFrameCount?: number;
   contentsFramesPerRow?: number;
+  contentsFramesPerSecond?: number;
   contentsFrameMode?: string;
+  repeatCount?: number;
 
   birthRate?: number;
   lifetime?: number;
@@ -36,10 +51,16 @@ export type Cell = {
   xAcceleration?: number;
   yAcceleration?: number;
   emissionLongitude?: number;
+  emissionLatitude?: number;
   emissionRange?: number;
   spin?: number;
   spinRange?: number;
   rotation?: number;
+  rotationRange?: number;
+  beginTime?: number;
+  duration?: number;
+  timeOffset?: number;
+  contentsScale?: number;
 };
 
 export type EmitterNode = {
@@ -49,11 +70,19 @@ export type EmitterNode = {
   birthRate: number;
   speed: number;
   scale: number;
-  shape: "point" | "line" | "rectangle" | string;
+  shape: "point" | "line" | "rectangle" | "path" | string;
   mode: string;
+  /** Skia blend mode derived from Core Animation's renderMode. */
+  blendMode: BlendModeName;
+  beginTime: number;
+  duration: number;
+  /** -1 means repeatCount="Inf": the duration window loops forever. */
+  repeatCount: number;
   emitterPosition: [number, number];
   emitterSize: [number, number];
-  cullRect?: number[];
+  cullRect?: number[] | null;
+  /** Present when emitterShape is "path" -- the lightning bolt outlines. */
+  path?: number[][];
   cells: Cell[];
 };
 
@@ -72,7 +101,6 @@ export type ImageNode = {
     speed: number;
     from: number;
     to: number;
-    repeat: boolean;
   } | null;
 };
 
