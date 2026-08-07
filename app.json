@@ -1,13 +1,14 @@
 {
   "expo": {
-    "name": "weather-bg",
-    "slug": "weather-bg",
+    "name": "weather-app",
+    "slug": "weather-app",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.anonymous.weather-app"
     },
     "android": {
       "adaptiveIcon": {
@@ -20,6 +21,9 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      "expo-asset"
+    ]
   }
 }
