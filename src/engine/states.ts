@@ -28,14 +28,27 @@ export function resolveState(scene: Scene, name: string): Overrides {
       (out[s.targetId] ??= {})[s.keyPath] = s.value;
     }
     // A removed emitter cell is expressed as an element removal; mark the cell
-    // disabled so the renderer skips it.
+    // disabled so the renderer skips it. A removed sublayer (the hail keyline
+    // bounces, the star fields, the lens flares) marks the whole node instead.
     for (const r of entry.remove) {
       if (r.keyPath === "emitterCells" && r.name) {
         (out[r.targetId] ??= {})[`emitterCells.${r.name}.enabled`] = 0;
+      } else if (r.keyPath === "sublayers") {
+        (out[r.targetId] ??= {})["removed"] = 1;
       }
     }
   }
   return out;
+}
+
+/** True when this state removes or hides the node, directly or via a group. */
+export function nodeRemoved(
+  overrides: Overrides,
+  node: { id?: string; groups?: string[] }
+): boolean {
+  const gone = (id: string | undefined) =>
+    id !== undefined && (overrides[id]?.["removed"] === 1 || overrides[id]?.["hidden"] === 1);
+  return gone(node.id) || (node.groups ?? []).some(gone);
 }
 
 /** Read `emitterCells.<name>.birthRate` style overrides for one cell. */

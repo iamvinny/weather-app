@@ -40,7 +40,7 @@ export const SceneBackground = ({ sceneName, state, headerHeight }: Props) => {
           canvasHeight={height}
           viewHeight={headerHeight}
           state={state}
-          sky={skyFor(sceneName)}
+          sky={scene.backgroundColor ?? skyFor(sceneName)}
         />
       )}
     </Animated.View>

@@ -4,7 +4,7 @@ import { useDerivedValue, type SharedValue } from "react-native-reanimated";
 import { CellLayer } from "./CellLayer";
 import { TileLayer } from "./TileLayer";
 import { prepareCell } from "./emitter";
-import { cellOverride, nodeOverride, resolveState } from "./states";
+import { cellOverride, nodeOverride, nodeRemoved, resolveState } from "./states";
 import type { EmitterNode, ImageNode, Scene } from "./types";
 
 type Props = {
@@ -56,6 +56,7 @@ export const WeatherScene = ({
   const emitters = useMemo(() => {
     return scene.nodes
       .filter((n): n is EmitterNode => n.type === "emitter")
+      .filter((n) => !nodeRemoved(overrides, n))
       .map((node) => {
         const emitter: EmitterNode = {
           ...node,
@@ -105,8 +106,12 @@ export const WeatherScene = ({
   }, [width, canvasHeight, band, dw]);
 
   const tiles = useMemo(
-    () => scene.nodes.filter((n): n is ImageNode => n.type === "image" && (n.opacity ?? 1) > 0),
-    [scene]
+    () =>
+      scene.nodes.filter(
+        (n): n is ImageNode =>
+          n.type === "image" && (n.opacity ?? 1) > 0 && !nodeRemoved(overrides, n)
+      ),
+    [scene, overrides]
   );
 
   return (

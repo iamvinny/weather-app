@@ -101,7 +101,28 @@ export type PreparedCell = {
   attractorForce: number;
   attractorFalloff: number;
   alignToMotion: number;
+  /** alignToMotion's own rotation offset (screen-space radians). */
+  alignRotation: number;
+  /**
+   * The `light` behavior, approximated: an alpha gain of ambient + diffuse
+   * falling off linearly with distance from the light. Only enabled for cells
+   * authored with base alpha 0 — those exist to be revealed by the light
+   * (the rain in mixedRainAndSleet); brighter cells keep their authored look.
+   */
+  lightGain: number;
+  lightX: number;
+  lightY: number;
+  lightAmbient: number;
+  lightDiffuse: number;
+  lightFalloff: number;
   timeScale: number;
+  /**
+   * Cycle length of one particle slot. Alive while `age <= life`, dead for
+   * the rest of the cycle — this is what gives low-birth-rate cells (the
+   * shooting star, the corner twinkles) their duty cycle instead of a
+   * permanently full field.
+   */
+  slotPeriod: number;
 
   // Burst scheduling. `period` of 0 means the cell emits continuously.
   period: number;
@@ -119,7 +140,8 @@ export type PreparedCell = {
   frameW: number;
   frameH: number;
   frameFPS: number;
-  frameRandom: number;
+  /** 0: animate over life, 1: random per particle, 2: sequential per particle. */
+  frameMode: number;
 };
 
 function findBehavior(behaviors: Behavior[] | undefined, kind: string, keyPath?: string) {
@@ -145,6 +167,9 @@ export function prepareCell(
   const lifetime = cell.lifetime ?? 1;
   const lifetimeRange = cell.lifetimeRange ?? 0;
   const rate = (cell.birthRate ?? 0) * emitter.birthRate * birthScale;
+  // CAEmitterLayer.scale (attribute, LKState override, or the layer's own
+  // transform scale) magnifies what the cells draw.
+  const mag = emitter.scale || 1;
 
   const path = emitter.path ?? [];
   const onPath = emitter.shape === "path" && path.length > 1;
@@ -164,6 +189,9 @@ export function prepareCell(
   const dist = findBehavior(cell.behaviors, "valueOverDistance", "color.alpha");
   const attractor = findBehavior(cell.behaviors, "attractor");
   const align = findBehavior(cell.behaviors, "alignToMotion");
+  const light = findBehavior(cell.behaviors, "light");
+  const lit =
+    light && (light.appliesAlpha ?? 0) > 0 && cell.color[3] <= 0.01 ? 1 : 0;
 
   const [w, h] = emitter.emitterSize;
   const line = emitter.shape === "line";
@@ -174,26 +202,44 @@ export function prepareCell(
   const usable = rect && rect.length === 4 && rect[2] <= 1 && rect[3] <= 1;
   const frameCount = cell.contentsFrameCount ?? 0;
 
+  // Emission direction, in three tiers:
+  //
+  // 1. An authored angle (cell emissionLongitude and/or the layer's own
+  //    rotation) negates on the y-flip to screen space. Every non-zero value
+  //    in the corpus lands somewhere sensible that way: thunderstorm -90 ->
+  //    straight down, blizzard -162 -> a wind-blown slant, the sunny lens
+  //    flare's layer rotation -60 -> a streak toward the bottom right.
+  // 2. No angle but *negative* velocity means Core Animation's default +x
+  //    axis, travelled backwards: every horizontal drifter (smoke, fog, haze,
+  //    dust, the wind debris, blowing snow, the hurricane bands) is authored
+  //    as velocity -800-ish along an unrotated layer.
+  // 3. No angle and positive velocity falls back to the container's downward
+  //    direction -- rain_night omits the attribute entirely and must fall.
+  //    (Apple's tooling writes a literal 0 with the same intent.)
+  //
+  // An emissionLatitude of pi flips the direction in-plane (the hail keyline
+  // carriers drift -x that way).
+  const lon = cell.emissionLongitude ?? 0;
+  const off = emitter.angleOffset ?? 0;
+  let angle =
+    lon !== 0 || off !== 0
+      ? -(lon + off)
+      : (cell.velocity ?? 0) < 0
+        ? 0
+        : sceneRotation;
+  if (Math.abs(cell.emissionLatitude ?? 0) > 3) angle += Math.PI;
+
   return {
     count,
     lifetime,
     lifetimeRange,
-    velocity: cell.velocity ?? 0,
-    velocityRange: cell.velocityRange ?? 0,
-    // Emission direction. The design space is y-up, so an authored angle
-    // negates on the flip to screen space; every non-zero value in the corpus
-    // lands somewhere downward that way (thunderstorm -90 -> straight down,
-    // blizzard -162 and tropicalStorm -151 -> steep wind-blown slants, the
-    // shooting star -70 -> down and to the right).
-    //
-    // Zero is treated as "unspecified" rather than "point along +x": rain_night
-    // omits the attribute entirely and must fall, so down is this pipeline's
-    // default, and Apple's tooling writes a literal 0 for the same intent.
-    angle: cell.emissionLongitude ? -cell.emissionLongitude : sceneRotation,
+    velocity: (cell.velocity ?? 0) * mag,
+    velocityRange: (cell.velocityRange ?? 0) * mag,
+    angle,
     emissionRange: cell.emissionRange ?? 0,
-    scale: cell.scale ?? 1,
-    scaleRange: cell.scaleRange ?? 0,
-    scaleSpeed: cell.scaleSpeed ?? 0,
+    scale: (cell.scale ?? 1) * mag,
+    scaleRange: (cell.scaleRange ?? 0) * mag,
+    scaleSpeed: (cell.scaleSpeed ?? 0) * mag,
     alpha: cell.color[3],
     alphaRange: cell.alphaRange ?? 0,
     alphaSpeed: cell.alphaSpeed ?? 0,
@@ -223,8 +269,24 @@ export function prepareCell(
     attractorForce: attractor?.force ?? 0,
     attractorFalloff: attractor?.falloff || 1,
     alignToMotion: align ? 1 : 0,
+    // The behavior's rotation is authored y-up; negate like every other angle.
+    alignRotation: align ? -(align.rotation ?? 0) : 0,
+    lightGain: lit,
+    lightX: light?.position?.[0] ?? 0,
+    lightY: light?.position?.[1] ?? 0,
+    lightAmbient: light?.ambientIntensity ?? 0,
+    lightDiffuse: light?.diffuseIntensity ?? 1,
+    lightFalloff: light?.falloff || 1000,
     // CAEmitterLayer.speed scales the emitter's whole sense of time.
     timeScale: emitter.speed || 1,
+    // A slot re-births every count/rate seconds; when that exceeds the
+    // lifetime the particle spends the difference dead. When the demand hit
+    // the particle cap the field is denser than authored anyway, so keep
+    // every slot fully occupied rather than shortening lives.
+    slotPeriod:
+      count > 0 && rate > 0
+        ? Math.max(lifetime + lifetimeRange, count / rate)
+        : lifetime + lifetimeRange,
 
     period,
     phase: emitter.beginTime + (cell.beginTime ?? 0),
@@ -239,7 +301,15 @@ export function prepareCell(
     frameW: usable ? rect![2] : 1,
     frameH: usable ? rect![3] : 1,
     frameFPS: cell.contentsFramesPerSecond ?? 0,
-    frameRandom: cell.contentsFrameMode === "random" ? 1 : 0,
+    // "sequential" without a frame rate deals each particle the next frame in
+    // the sheet, fixed for its whole life (the lens-flare heptagon variants);
+    // with a rate it is an ordered animation like the default mode.
+    frameMode:
+      cell.contentsFrameMode === "random"
+        ? 1
+        : cell.contentsFrameMode === "sequential" && !cell.contentsFramesPerSecond
+          ? 2
+          : 0,
   };
 }
 
@@ -270,9 +340,11 @@ function ageOf(p: PreparedCell, t: number, i: number): number {
     return age < 0 || age > life ? -1 : age;
   }
 
-  const born = (i / p.count) * life;
-  const age = (local - born) % life;
-  return age < 0 ? age + life : age;
+  const cycle = p.slotPeriod > life ? p.slotPeriod : life;
+  const born = (i / p.count) * cycle;
+  let age = (local - born) % cycle;
+  if (age < 0) age += cycle;
+  return age > life ? -1 : age;
 }
 
 function distOf(p: PreparedCell, age: number, i: number): number {
@@ -348,6 +420,13 @@ export function particleAlpha(p: PreparedCell, t: number, i: number): number {
   if (y < p.cullTop || y > p.cullBottom) return 0;
 
   let a = p.alpha + p.alphaRange * spread(i, 6) + p.alphaSpeed * age;
+  if (p.lightGain === 1) {
+    const dx = xOf(p, age, i, dist) - p.lightX;
+    const dy = y - p.lightY;
+    const d = Math.sqrt(dx * dx + dy * dy);
+    const fall = 1 - d / p.lightFalloff;
+    a += p.lightAmbient + p.lightDiffuse * (fall > 0 ? fall : 0);
+  }
   const u = age / lifeOf(p, i);
   if (p.alphaOverLife.length) a *= sampleCurve(p.alphaOverLife, u);
   if (p.colorOverLife.length) a *= sampleRGBA(p.colorOverLife, u, 3);
@@ -392,9 +471,18 @@ export function particleXform(
   }
 
   const dist = distOf(p, age, i);
+  // alignToMotion turns the sprite's vertical axis along the motion vector
+  // (Raindrop.png and the sleet frames are authored as vertical streaks),
+  // plus the behavior's own rotation offset; the cell's rotation is ignored.
+  // A negative per-particle velocity travels the direction backwards, so the
+  // motion vector flips with it. Confirmed by mixedRainAndSleet, whose Rain
+  // and Sleet cells carry different rotations yet must render identically.
   const rot =
     p.alignToMotion === 1
-      ? dirOf(p, i) + p.rotation
+      ? dirOf(p, i) +
+        (p.velocity + p.velocityRange * spread(i, 3) < 0 ? Math.PI : 0) -
+        Math.PI / 2 +
+        p.alignRotation
       : p.rotation + (p.spin + p.spinRange * spread(i, 8)) * age;
   const scos = Math.cos(rot) * s;
   const ssin = Math.sin(rot) * s;
@@ -428,8 +516,10 @@ export function particleFrame(
   }
 
   let frame: number;
-  if (p.frameRandom === 1) {
+  if (p.frameMode === 1) {
     frame = Math.floor(rnd(i, 11) * p.frameCount);
+  } else if (p.frameMode === 2) {
+    frame = i % p.frameCount;
   } else {
     const age = ageOf(p, t, i);
     // A framesPerSecond of 0 means the sheet plays across the whole lifetime.

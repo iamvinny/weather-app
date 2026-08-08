@@ -22,6 +22,12 @@ export type Behavior = {
   orientationLongitude?: number;
   stiffness?: number;
   radius?: number;
+  /** alignToMotion: extra sprite rotation on top of the motion direction. */
+  rotation?: number;
+  /** light: intensity floor, cone gain, and whether it modulates alpha. */
+  ambientIntensity?: number;
+  diffuseIntensity?: number;
+  appliesAlpha?: number;
   position?: number[];
 };
 
@@ -66,6 +72,8 @@ export type Cell = {
 export type EmitterNode = {
   type: "emitter";
   id?: string;
+  /** Ids of the group layers above this node; hiding a group hides it too. */
+  groups?: string[];
   name: string;
   birthRate: number;
   speed: number;
@@ -78,6 +86,12 @@ export type EmitterNode = {
   duration: number;
   /** -1 means repeatCount="Inf": the duration window loops forever. */
   repeatCount: number;
+  /**
+   * Rotation of the emitter layer itself (y-up radians, from its transform
+   * and/or a transform.rotation.z animation). Added to every cell's emission
+   * angle — the sunny lens flare aims its streak this way.
+   */
+  angleOffset?: number;
   emitterPosition: [number, number];
   emitterSize: [number, number];
   cullRect?: number[] | null;
@@ -89,18 +103,26 @@ export type EmitterNode = {
 export type ImageNode = {
   type: "image";
   id?: string;
+  /** Ids of the group layers above this node; hiding a group hides it too. */
+  groups?: string[];
   name: string;
   image: string;
   frame: [number, number, number, number];
   opacity: number;
   tiled: boolean;
   contentsScale: number;
+  /**
+   * Projective correction (3x3 row-major, screen space) from where `frame`
+   * puts the layer to where its transform chain actually lands it — the
+   * perspective-tilted cloud planes, scaled/rotated precipitation tiles.
+   */
+  matrix?: number[];
+  /** Slide vector per period, applied inside `matrix`. */
   scroll: {
-    keyPath: string;
     duration: number;
     speed: number;
-    from: number;
-    to: number;
+    dx: number;
+    dy: number;
   } | null;
 };
 
@@ -117,6 +139,12 @@ export type Scene = {
   designSize: [number, number];
   deviceScale: number;
   rotation: number;
+  /**
+   * Sky colour baked into the scene, when it carries one. Only the
+   * thunderstorm-family scenes back themselves with a coloured layer; for the
+   * rest this is null and the app supplies a backdrop (src/constants/sky.ts).
+   */
+  backgroundColor?: string | null;
   nodes: SceneNode[];
   states: Record<string, StateEntry>;
 };

@@ -1,9 +1,11 @@
 /**
- * Backdrop colours.
+ * Fallback backdrop colours.
  *
- * The .caml scenes carry precipitation and lighting only — Apple ships the sky
- * as a pre-rendered PNG, and there is not a single CAGradientLayer in the whole
- * corpus. So the backdrop is ours to pick; key it off the scene's time of day.
+ * The thunderstorm-family scenes carry their sky as a coloured "🔳 Underlying"
+ * layer, which the converter extracts into `scene.backgroundColor`. Every
+ * other condition ships no backdrop at all (and there is not a single
+ * CAGradientLayer in the corpus), so the backdrop is ours to pick; key it off
+ * the scene's time of day.
  */
 export function skyFor(sceneName: string) {
   if (sceneName.endsWith("_day")) return "#4a7ba8";

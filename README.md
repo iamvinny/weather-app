@@ -71,15 +71,59 @@ cover the device. The converter flips to y-down. This is confirmed by the `Mini`
 state, which culls the rain emitter to design y 846..2046 — the top 290px of the
 screen once flipped, i.e. the collapsed header.
 
-**Most cells take their direction from the container.** 701 of 903 cells carry
-no `emissionLongitude` at all, so their travel direction comes from the
-`Rotation` layer the app turns at runtime. That is also how the app tilts
-precipitation with wind: change `scene.rotation` (π/2 is straight down) and
-rain slants.
+**Direction resolves in three tiers.** 701 of 903 cells carry no
+`emissionLongitude`. An authored angle (cell longitude and/or the emitter
+layer's own rotation — the sunny lens flare aims its streak with a
+`transform.rotation.z` animation) is used directly, negated on the y-flip. No
+angle but *negative* velocity means Core Animation's default +x axis travelled
+backwards: every horizontal drifter (smoke, fog, haze, dust, wind debris,
+blowing snow, the hurricane bands) is authored as velocity −800-ish along an
+unrotated layer. No angle and positive velocity falls back to the container's
+downward direction, which the app tilts with wind at runtime: change
+`scene.rotation` (π/2 is straight down) and rain slants.
 
-**There are no gradient layers.** Zero `CAGradientLayer` instances across all
-537 files — skies ship as pre-rendered PNGs, so `src/constants/sky.ts` supplies
-a flat backdrop.
+**Scroll keyframes are absolute positions, and tiles are 3D planes.** A tile's
+`position.x/y` animation *overrides* its static position attribute (drizzle's
+cloud sits at x −895.9 but animates 0 → −768) — the converter rebases the
+frame on the animation's start and keeps the slide vector, whose length is a
+multiple of the tile image's width; that is what makes the loop seamless.
+Several cloud tiles also sit under layers with full perspective
+`CATransform3D`s (the drizzle/tornado cloud planes recede toward the horizon)
+or scaled/rotated containers (the blizzard snow tiles run at −72.3°). The
+converter folds the whole chain into one projective 3×3 per image node,
+applied outside the scroll so the slide stays in the layer's own space, exactly
+as Core Animation composes it.
+
+**There are no gradient layers, but storms carry a sky colour.** Zero
+`CAGradientLayer` instances across all 537 files. The thunderstorm-family
+scenes (8 conditions) back themselves with a flat "🔳 Underlying" CALayer whose
+`backgroundColor` is the sky — the converter extracts it into
+`scene.backgroundColor`. Every other condition ships no backdrop at all, so
+`src/constants/sky.ts` supplies a fallback keyed off time of day.
+
+**Some layers exist only inside state records.** `LKStateRemoveElement` comes
+in two forms: a reference (`objectId`) to a layer in the base tree, or a fully
+serialized `<object>` for a layer that appears *nowhere else* — present by
+default, taken out when the state (always `Mini` here) activates, serialized in
+full so the state machine can restore it. The hail/sleet keyline bounces, the
+star fields in `clear`, the lens flares in `sunny`/`hot`, the rainbow layer in
+`mostlySunny`, and the tornado debris all live solely in these records: a
+converter that walks only `sublayers` silently drops them from every state,
+`Full` included. The converter re-parents each serialized object under its
+recorded target (offsets and timing come along) and retargets the removal at a
+synthetic id the renderer hides in `Mini`.
+
+**Cells nest.** The keyline bounce emitters use a carrier cell (no image,
+velocity ≤ 1, drifting along a line) whose *children* are the visible bouncing
+stones. The runtime simulates one level, so the converter folds a child into an
+equivalent top-level cell at its steady-state rate — carriers/sec × children
+emitted per carrier window — spawning from the carrier's region.
+
+**Accelerations share the y-up frame.** `yAcceleration` is signed in the same
+y-up space as the geometry: snow carries +50 (air-resistance lift slowing its
+fall) while the hail and sleet bounces carry −2000/−3500 (gravity). The
+converter negates it along with the y-flip; copy it through unsigned and snow
+speeds up instead of floating while hail falls up.
 
 **Additive layers need the sky inside the canvas.** 377 emitters use
 `renderMode="cheapAdditive"`, and additive sprites are authored on black
@@ -119,6 +163,11 @@ damping values suitable for feeding straight into Reanimated.
 Apple's emitters are steady-state: a constant birth rate feeding a fixed
 lifetime. So instead of mutable particle state, each particle index owns a
 deterministic seed and its entire life is a pure function of the clock. Each
+slot cycles with period `max(lifetime, count/birthRate)` and is alive only
+while its age is within its lifetime — that quotient is what gives
+low-birth-rate cells their duty cycle: the corner twinkles in `clear` flash
+~20% of the time and the shooting star streaks once a minute instead of both
+looping continuously. Each
 atlas slot is evaluated independently, straight from the clock — there is no
 cross-frame state for Reanimated to serialize, nothing to compact when a
 particle dies, and no per-frame allocation. The field is already full on the
@@ -198,10 +247,10 @@ You can keep this engine and adopt the VFX *art* without the VFX runtime: swap
 in the cloud textures and drive the POS/NEG blend from a sun-angle value you
 supply yourself. The textures need KTX/HEIC → PNG conversion first.
 
-### Unchecked lead
+### Checked lead: the widget JSONs are a dead end
 
-`PlugIns/WeatherWidget.appex/` contains `ClearDay.json` and `RainyDay.json`.
-Condition-named JSON sitting beside the widget is exactly where a preset table
-would live. If those hold VFX parameter values, the trade-off above changes
-considerably — you would have the format, and the remaining conditions likely
-follow the same shape. Their contents have not been examined.
+`PlugIns/WeatherWidget.appex/ClearDay.json` and `RainyDay.json` looked like
+they might hold VFX parameter presets. They don't — they are canned *forecast*
+fixtures for the widget gallery preview (hourly temps for a town called
+Martin, one 120° day labelled "Super Hot"). No VFX parameters anywhere in
+them; recovering the presets still means digging them out of the binary.

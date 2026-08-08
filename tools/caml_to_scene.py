@@ -11,7 +11,7 @@ Scenes are authored in a fixed 640x1136 design space held by the "Rotation"
 layer, which is anchored bottom-left and uniformly scaled to cover the device.
 Core Animation authors it y-up; we flip to the y-down space renderers expect.
 """
-import glob, json, os, re, shutil, sys
+import copy, glob, json, math, os, re, shutil, sys
 from collections import defaultdict
 from xml.etree import ElementTree as ET
 
@@ -57,6 +57,81 @@ def nums(s, default=None):
 def scale_of(transform):
     m = re.search(r"scale\(\s*(-?\d+\.?\d*)", transform or "")
     return float(m.group(1)) if m else 1.0
+
+
+# -- 3x3 projective matrices, row-major, acting on column vectors (x, y, 1).
+# The y-up design space is kept throughout; flip_y conjugates at the end.
+
+IDENT = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+
+
+def mat_mul(a, b):
+    return [sum(a[r * 3 + k] * b[k * 3 + c] for k in range(3))
+            for r in range(3) for c in range(3)]
+
+
+def mat_translate(tx, ty):
+    return [1.0, 0.0, tx, 0.0, 1.0, ty, 0.0, 0.0, 1.0]
+
+
+def mat_is_translation(m, tol=1e-9):
+    return all(abs(m[i] - IDENT[i]) < tol for i in (0, 1, 3, 4, 6, 7, 8))
+
+
+def parse_transform(t):
+    """A CALayer transform attribute -> 3x3, or None when identity.
+
+    CATransform3D is row-vector: x' = x*m11 + y*m21 + m41, w' = x*m14 + y*m24
+    + m44. The drizzle/tornado cloud planes use the perspective terms -- they
+    are 3D-tilted so the tile recedes toward the horizon.
+    """
+    if not t:
+        return None
+    m = re.match(r"\s*scale\(([^)]*)\)", t)
+    if m:
+        v = nums(m.group(1), [1.0])
+        sx, sy = v[0], v[1] if len(v) > 1 else v[0]
+        return None if sx == 1 and sy == 1 else [sx, 0, 0, 0, sy, 0, 0, 0, 1]
+    m = re.match(r"\s*rotate\((-?\d+\.?\d*)deg\)", t)
+    if m:
+        a = math.radians(float(m.group(1)))
+        c, s = math.cos(a), math.sin(a)
+        return [c, -s, 0, s, c, 0, 0, 0, 1]
+    m = re.match(r"\s*matrix\(([^)]*)\)", t)
+    if m:
+        v = nums(m.group(1))
+        if len(v) == 16:
+            return [v[0], v[4], v[12],
+                    v[1], v[5], v[13],
+                    v[3], v[7], v[15]]
+    return None
+
+
+def layer_matrix(el, pos, anchor, bounds):
+    """local -> parent: translate(position) . transform . translate(-anchor)."""
+    t = parse_transform(el.get("transform"))
+    if t is None:
+        return None
+    ax, ay = anchor[0] * bounds[2], anchor[1] * bounds[3]
+    return mat_mul(mat_translate(pos[0], pos[1]),
+                   mat_mul(t, mat_translate(-ax, -ay)))
+
+
+def rotation_of(el):
+    """The layer's z-rotation: static transform plus the midpoint of any
+    transform.rotation.z keyframe animation (the sunny lens flare aims its
+    emission with a wobbling rotation animation; the wobble is subtle, the
+    orientation is not)."""
+    rot = 0.0
+    m = re.match(r"\s*rotate\((-?\d+\.?\d*)deg\)", el.get("transform") or "")
+    if m:
+        rot += math.radians(float(m.group(1)))
+    for a in el.findall(f"{NS}animations/{NS}p"):
+        if a.get("keyPath") == "transform.rotation.z":
+            vals = values_of(a)
+            if vals:
+                rot += sum(vals) / len(vals)
+    return rot
 
 
 def repeat_of(el):
@@ -153,6 +228,30 @@ CELL_FLOATS = [
 ]
 
 
+def locations_of(el):
+    node = el.find(NS + "locations")
+    if node is None:
+        return None
+    return [float(v.get("value", 0)) for v in node]
+
+
+def resample(values, locations, n=16):
+    """Rebuild a keyframed curve with non-uniform locations as n uniform
+    samples, so the runtime's uniform piecewise-linear sampler stays simple.
+    The smoke alpha ramp holds 0->1 over [0, 0.1] then 1->0 over [0.9, 1]."""
+    out = []
+    for i in range(n):
+        u = i / (n - 1)
+        k = 0
+        while k < len(locations) - 2 and locations[k + 1] < u:
+            k += 1
+        a, b = locations[k], locations[k + 1]
+        t = 0.0 if b <= a else (u - a) / (b - a)
+        t = min(1.0, max(0.0, t))
+        out.append(values[k] + (values[k + 1] - values[k]) * t)
+    return out
+
+
 def parse_behaviors(el):
     out = []
     for b in el.findall(f"{NS}emitterBehaviors/{NS}CAEmitterBehavior"):
@@ -162,10 +261,14 @@ def parse_behaviors(el):
             "enabled": b.get("enabled", "1") != "0",
         }
         vals = values_of(b) or colors_of(b)
+        locs = locations_of(b)
+        if vals and locs and len(locs) == len(vals):
+            vals = resample(vals, locs)
         if vals:
             bd["values"] = vals
         for k in ("force", "frequency", "falloff", "falloffDistance",
-                  "orientationLatitude", "orientationLongitude", "stiffness", "radius"):
+                  "orientationLatitude", "orientationLongitude", "stiffness", "radius",
+                  "rotation", "ambientIntensity", "diffuseIntensity", "appliesAlpha"):
             if b.get(k) is not None:
                 bd[k] = f(b, k)
         if b.get("position"):
@@ -174,8 +277,8 @@ def parse_behaviors(el):
     return out
 
 
-def parse_cell(el):
-    cell = {"name": el.get("name") or "cell", "enabled": el.get("enabled", "1") != "0"}
+def parse_cell(el, prefix=""):
+    cell = {"name": prefix + (el.get("name") or "cell"), "enabled": el.get("enabled", "1") != "0"}
     for k in CELL_FLOATS:
         if el.get(k) is not None:
             cell[k] = f(el, k)
@@ -199,6 +302,33 @@ def parse_cell(el):
     return cell
 
 
+def flatten_cells(el, prefix=""):
+    """Parse a cell list, folding nested cells into equivalent top-level ones.
+
+    CAEmitterCells can nest: a carrier cell spawns children from wherever it
+    happens to be. The hail and sleet "keyline" emitters use this -- an
+    invisible carrier drifting along a line (velocity <= 1) whose children are
+    the visible bouncing stones. The runtime simulates one level, so a child
+    becomes a top-level cell emitting from the carrier's spawn region at its
+    steady-state rate: carriers/sec x children each carrier emits during its
+    window (its own `duration`, else the carrier's lifetime).
+    """
+    out = []
+    for c in el.findall(f"{NS}emitterCells/{NS}CAEmitterCell"):
+        cell = parse_cell(c, prefix)
+        out.append(cell)
+        for k in c.findall(f"{NS}emitterCells/{NS}CAEmitterCell"):
+            kid = parse_cell(k, cell["name"] + "/")
+            if k.find(f"{NS}emitterCells/{NS}CAEmitterCell") is not None:
+                print("  ! cells nested deeper than one level; dropping the rest")
+            window = kid.get("duration") or cell.get("lifetime") or 1.0
+            kid["birthRate"] = cell.get("birthRate", 0.0) * kid.get("birthRate", 0.0) * window
+            kid.pop("duration", None)
+            kid.pop("beginTime", None)
+            out.append(kid)
+    return out
+
+
 def parse_emitter(el):
     shape = el.get("emitterShape", "point")
     em = {
@@ -217,32 +347,62 @@ def parse_emitter(el):
         "emitterPosition": nums(el.get("emitterPosition"), [0.0, 0.0]),
         "emitterSize": nums(el.get("emitterSize"), [0.0, 0.0]),
         "cullRect": nums(el.get("cullRect")),
-        "cells": [parse_cell(c) for c in el.findall(f"{NS}emitterCells/{NS}CAEmitterCell")],
+        "cells": flatten_cells(el),
     }
     if shape == "path":
         em["path"] = parse_path(el.get("emitterPath"))
+    # Behaviors can live on the emitter layer as well as on cells -- the smoke
+    # scenes keep their alpha-over-life ramp there. They apply to every cell.
+    # Deep-copied per cell: flip_y mutates behavior positions, and a dict
+    # shared across cells would be flipped once per cell.
+    shared = parse_behaviors(el)
+    if shared:
+        for c in em["cells"]:
+            c["behaviors"] = c.get("behaviors", []) + copy.deepcopy(shared)
     return em
 
 
 def parse_image_layer(el, contents):
     bounds = nums(el.get("bounds"), [0, 0, 0, 0])
-    pos = nums(el.get("position"), [0, 0])
+    pos = list(nums(el.get("position"), [0, 0]))
     anchor = nums(el.get("anchorPoint"), [0.5, 0.5])
     w, h = bounds[2], bounds[3]
+
+    # A scroll animation's keyframes are *absolute* positions that override the
+    # layer's static position attribute (drizzle's tile sits at x -895.9 but
+    # animates 0 -> -768). Rebase the frame on the animation's start and keep
+    # only the slide vector; the slide distance is a multiple of the tile's
+    # image width, which is what makes the loop seamless.
+    anim = keyframe_anim(el)
+    scroll = None
+    if anim:
+        axis = 0 if anim["keyPath"] == "position.x" else 1
+        delta = anim["to"] - anim["from"]
+        pos[axis] = anim["from"]
+        scroll = {
+            "duration": anim["duration"],
+            "speed": anim["speed"],
+            "dx": delta if axis == 0 else 0.0,
+            "dy": delta if axis == 1 else 0.0,
+        }
+
     return {
         "type": "image",
         "id": el.get("id"),
         "name": el.get("name") or "image",
         "image": os.path.basename(contents.get("src")),
         "frame": [pos[0] - anchor[0] * w, pos[1] - anchor[1] * h, w, h],
+        "position": pos,
+        "anchor": anchor,
         "opacity": f(el, "opacity", 1.0),
         "tiled": el.get("contentsScaling") == "repeat",
         "contentsScale": f(el, "contentsScale", 1.0),
-        "scroll": keyframe_anim(el),
+        "scroll": scroll,
     }
 
 
-def collect(el, out, ox=0.0, oy=0.0, phase=0.0, tscale=1.0, pduration=0.0, prepeat=0):
+def collect(el, out, ox=0.0, oy=0.0, phase=0.0, tscale=1.0, pduration=0.0,
+            prepeat=0, gids=(), opacity=1.0, frames=None, acc=None):
     """Walk the layer tree in draw order, accumulating parent offsets.
 
     Containers are not always plain CALayers -- the lightning bolts in the
@@ -254,6 +414,14 @@ def collect(el, out, ox=0.0, oy=0.0, phase=0.0, tscale=1.0, pduration=0.0, prepe
     we compose it into a single (phase, tscale) per emitter. Without this the
     bolt sub-emitters all inherit beginTime 0 and fire simultaneously instead
     of staggering across the storm.
+
+    Flattening also loses the ancestry LKStates target, so each node records
+    the ids of the groups above it (`groups`) -- removing or hiding a group id
+    must take its whole subtree with it -- and `frames` collects id ->
+    (offset, timing) so layers serialized inside state removal records can be
+    positioned as if they still hung off their parent. Group opacity folds
+    down for the same reason: an image multiplies it into its own, an
+    emitter into its cells' colours.
     """
     for child in el.findall(f"{NS}sublayers/*"):
         t = tag(child)
@@ -264,11 +432,34 @@ def collect(el, out, ox=0.0, oy=0.0, phase=0.0, tscale=1.0, pduration=0.0, prepe
         # t_child = (t_parent - beginTime) * speed, composed with the ancestors.
         child_phase = phase + f(child, "beginTime", 0.0) / (tscale or 1.0)
         child_tscale = tscale * (f(child, "speed", 1.0) or 1.0)
+        child_opacity = opacity * f(child, "opacity", 1.0)
+        cid = child.get("id")
+        child_gids = gids + (cid,) if cid else gids
 
         if t == "CAEmitterLayer":
             em = parse_emitter(child)
             em["beginTime"] = child_phase
             em["speed"] = child_tscale
+            if gids:
+                em["groups"] = list(gids)
+            if child_opacity != 1.0:
+                for c in em["cells"]:
+                    c["color"][3] *= child_opacity
+            # The emitter layer's own transform: scale multiplies what the
+            # cells draw, rotation re-aims their emission (the sunny lens
+            # flare points its streak with a transform rotation).
+            em["scale"] *= scale_of(child.get("transform"))
+            rot = rotation_of(child)
+            if rot:
+                em["angleOffset"] = rot
+            # An infinitely-repeating emitter with no duration anywhere in its
+            # chain is driven by the app adding and removing the layer at
+            # runtime (the isolated-thunderstorm bolt). Its cells still define
+            # burst windows; give the cycle a period so it strikes rather than
+            # accumulating forever. ~15s matches the storm scenes' cadence.
+            if (em["repeatCount"] == -1 and em["duration"] <= 0 and prepeat != -1
+                    and any(c.get("duration", 0) > 0 for c in em["cells"])):
+                em["duration"] = 15.0 * (child_tscale or 1.0)
             # A child's active window is clipped by its parent's, so a
             # sub-emitter that declares no duration of its own repeats on the
             # parent's cycle. The lightning branches rely on this: without it
@@ -287,29 +478,77 @@ def collect(el, out, ox=0.0, oy=0.0, phase=0.0, tscale=1.0, pduration=0.0, prepe
             if em.get("path"):
                 em["path"] = [[p[0] + base_x, p[1] + base_y] for p in em["path"]]
             out.append(em)
+            if frames is not None and cid:
+                frames[cid] = (base_x, base_y, child_phase, child_tscale,
+                               em["duration"], em["repeatCount"])
             # Emitters can host their own sublayers; keep descending.
             collect(child, out, base_x, base_y, child_phase, child_tscale,
-                    em["duration"], em["repeatCount"])
+                    em["duration"], em["repeatCount"], child_gids, child_opacity, frames)
             continue
-
-        contents = child.find(NS + "contents")
-        if contents is not None and contents.get("src"):
-            layer = parse_image_layer(child, contents)
-            layer["frame"][0] += ox
-            layer["frame"][1] += oy
-            out.append(layer)
 
         bounds = nums(child.get("bounds"), [0, 0, 0, 0])
         pos = nums(child.get("position"), [0, 0])
         anchor = nums(child.get("anchorPoint"), [0.5, 0.5])
-        collect(child, out,
-                ox + pos[0] - anchor[0] * bounds[2],
-                oy + pos[1] - anchor[1] * bounds[3],
-                child_phase, child_tscale, pduration, prepeat)
+
+        contents = child.find(NS + "contents")
+        if contents is not None and contents.get("src"):
+            layer = parse_image_layer(child, contents)
+            own_t = parse_transform(child.get("transform"))
+            lpos, lanchor = layer.pop("position"), layer.pop("anchor")
+            layer["frame"][0] += ox
+            layer["frame"][1] += oy
+            if own_t is not None or acc is not None:
+                # One projective map from where the flat frame math puts the
+                # layer to where the transform chain actually lands it. The
+                # runtime applies the scroll slide inside this map; that
+                # matches Core Animation only after the slide vector is pulled
+                # back through the layer's own transform (T.translate(inv(T)v)
+                # == translate(v).T), done below.
+                a_parent = acc if acc is not None else mat_translate(ox, oy)
+                p_self = layer_matrix(child, lpos, lanchor, bounds) \
+                    or mat_translate(layer["frame"][0] - ox, layer["frame"][1] - oy)
+                m = mat_mul(mat_mul(a_parent, p_self),
+                            mat_translate(-layer["frame"][0], -layer["frame"][1]))
+                if not mat_is_translation(m, 1e-6) or abs(m[2]) + abs(m[5]) > 1e-6:
+                    layer["matrix"] = m
+                if own_t is not None and layer["scroll"]:
+                    a, b, c, d = own_t[0], own_t[1], own_t[3], own_t[4]
+                    det = a * d - b * c or 1.0
+                    dx, dy = layer["scroll"]["dx"], layer["scroll"]["dy"]
+                    layer["scroll"]["dx"] = (d * dx - b * dy) / det
+                    layer["scroll"]["dy"] = (a * dy - c * dx) / det
+            layer["opacity"] *= opacity
+            if gids:
+                layer["groups"] = list(gids)
+            out.append(layer)
+
+        child_acc = acc
+        own_t = layer_matrix(child, pos, anchor, bounds)
+        if own_t is not None:
+            child_acc = mat_mul(acc or mat_translate(ox, oy), own_t)
+        elif acc is not None:
+            child_acc = mat_mul(acc, mat_translate(pos[0] - anchor[0] * bounds[2],
+                                                   pos[1] - anchor[1] * bounds[3]))
+        cx = ox + pos[0] - anchor[0] * bounds[2]
+        cy = oy + pos[1] - anchor[1] * bounds[3]
+        if frames is not None and cid:
+            frames[cid] = (cx, cy, child_phase, child_tscale, pduration, prepeat)
+        collect(child, out, cx, cy, child_phase, child_tscale,
+                pduration, prepeat, child_gids, child_opacity, frames, child_acc)
 
 
 def parse_states(root):
+    """Parse LKStates, and pull layers that exist only inside removal records.
+
+    Some layers never appear in the base sublayer tree at all: the hail and
+    sleet keyline emitters and the tornado plank debris live solely inside
+    `LKStateRemoveElement` records, fully serialized so the state machine can
+    restore them on the way out. They are present by default and removed when
+    the state (Mini) activates, so they must be parsed into the scene; the
+    removal record is retargeted at a synthetic id the runtime can hide.
+    """
     states = {}
+    removed = {}  # synthetic id -> serialized <object> element
     for st in root.findall(f"{NS}states/{NS}LKState"):
         entry = {"basedOn": st.get("basedOn"), "set": [], "remove": []}
         for e in st.findall(f"{NS}elements/*"):
@@ -322,13 +561,44 @@ def parse_states(root):
                 })
             elif tag(e) == "LKStateRemoveElement":
                 obj = e.find(NS + "object")
-                entry["remove"].append({
+                rec = {
                     "targetId": e.get("targetId"),
                     "keyPath": e.get("keyPath"),
                     "name": obj.get("name") if obj is not None else None,
-                })
+                }
+                if e.get("keyPath") == "sublayers":
+                    if e.get("objectId"):
+                        # References a layer that lives in the base tree (or
+                        # inside another removal record); remove it by id.
+                        rec["targetId"] = e.get("objectId")
+                    elif obj is not None and (obj.get("type") or "").endswith("Layer"):
+                        rid = f"#removed:{e.get('targetId')}:{rec['name'] or len(removed)}"
+                        removed.setdefault(rid, (e.get("targetId"), obj))
+                        rec["targetId"] = rid
+                entry["remove"].append(rec)
         states[st.get("name")] = entry
-    return states
+    return states, removed
+
+
+def backdrop_of(design):
+    """Sky colour, when the scene carries one.
+
+    The thunderstorm-family scenes back themselves with a '🔳 Underlying'
+    CALayer whose backgroundColor is the sky; every other condition ships no
+    backdrop and the app supplies one (src/constants/sky.ts).
+    """
+    for el in design.findall(f"{NS}sublayers/{NS}CALayer"):
+        if el.get("hidden") == "1":
+            continue
+        value, opacity = el.get("backgroundColor"), 1.0
+        if value is None:
+            c = el.find(NS + "backgroundColor")
+            if c is not None:
+                value, opacity = c.get("value"), float(c.get("opacity", 1))
+        if value and opacity > 0:
+            rgb = (nums(value, [0, 0, 0]) + [0, 0, 0])[:3]
+            return "#" + "".join(f"{round(x * 255):02x}" for x in rgb)
+    return None
 
 
 def flip_y(nodes, height):
@@ -337,15 +607,29 @@ def flip_y(nodes, height):
     Confirmed by the Mini state: it culls the rain emitter to design y
     846..2046, which flips to the top 290px -- the collapsed header.
     """
+    F = [1.0, 0.0, 0.0, 0.0, -1.0, height, 0.0, 0.0, 1.0]
     for n in nodes:
         if n["type"] == "image":
             x, y, w, h = n["frame"]
             n["frame"] = [x, height - (y + h), w, h]
-            if n["scroll"] and n["scroll"]["keyPath"] == "position.y":
-                n["scroll"]["from"] = -n["scroll"]["from"]
-                n["scroll"]["to"] = -n["scroll"]["to"]
+            if n["scroll"]:
+                n["scroll"]["dy"] = -n["scroll"]["dy"]
+            if n.get("matrix"):
+                n["matrix"] = mat_mul(F, mat_mul(n["matrix"], F))
         else:
             n["emitterPosition"][1] = height - n["emitterPosition"][1]
+            # Behavior anchors (the light cones, the attractors) live in the
+            # same y-up space as everything else.
+            for c in n["cells"]:
+                for b in c.get("behaviors", []):
+                    if b.get("position") and len(b["position"]) >= 2:
+                        b["position"][1] = height - b["position"][1]
+            # Accelerations share the geometry's y-up frame: snow carries +50
+            # (air-resistance lift slowing its fall) while the hail and sleet
+            # keyline bounces carry -2000/-3500 (gravity). Negate along with y.
+            for c in n["cells"]:
+                if c.get("yAcceleration"):
+                    c["yAcceleration"] = -c["yAcceleration"]
             if n.get("path"):
                 n["path"] = [[p[0], height - p[1]] for p in n["path"]]
             if n.get("cullRect") and len(n["cullRect"]) == 4:
@@ -372,7 +656,29 @@ def convert(path):
 
     bounds = nums(design.get("bounds"), [0, 0, 640, 1136])
     nodes = []
-    collect(design, nodes)
+    frames = {}
+    if design.get("id"):
+        frames[design.get("id")] = (0.0, 0.0, 0.0, 1.0, 0.0, 0)
+    collect(design, nodes, frames=frames)
+
+    # States hang off the root layer, not the design-space layer.
+    states, removed = parse_states(root_layer)
+
+    # Layers serialized inside removal records exist only there: they are
+    # present by default and taken out when the state (always Mini in this
+    # corpus) activates. Re-wrap each one as a sublayer of its recorded parent
+    # so collect() sees it with the right offsets and timing, and tag every
+    # node it yields with the synthetic id the retargeted removal points at.
+    for rid, (parent, obj) in removed.items():
+        ox, oy, phase, tscale, pdur, prep = frames.get(parent, (0, 0, 0, 1, 0, 0))
+        wrapper = ET.Element(NS + "CALayer")
+        sub = ET.SubElement(wrapper, NS + "sublayers")
+        el = copy.deepcopy(obj)
+        el.tag = NS + (obj.get("type") or "CALayer")
+        sub.append(el)
+        collect(wrapper, nodes, ox, oy, phase, tscale, pdur, prep,
+                gids=(rid,), frames=frames)
+
     flip_y(nodes, bounds[3])
 
     return {
@@ -384,9 +690,9 @@ def convert(path):
         # "Rotation"; it is also how the app tilts precipitation with wind).
         # In the flipped, y-down space we emit, +pi/2 points straight down.
         "rotation": 1.5707963267948966,
+        "backgroundColor": backdrop_of(design),
         "nodes": nodes,
-        # States hang off the root layer, not the design-space layer.
-        "states": parse_states(root_layer),
+        "states": states,
     }
 
 
